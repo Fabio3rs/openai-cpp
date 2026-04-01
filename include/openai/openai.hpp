@@ -508,25 +508,25 @@ public:
     OpenAI(OpenAI&&)                    = delete;
     OpenAI& operator=(OpenAI&&)         = delete;
 
-    void setToken(const std::string& token = "", const std::string& organization = "") { session_.setToken(token, organization); }
+    auto& setToken(const std::string& token = "", const std::string& organization = "") { session_.setToken(token, organization); return *this; }
 
-    void setProxy(const std::string& url) { session_.setProxyUrl(url); }
+    auto& setProxy(const std::string& url) { session_.setProxyUrl(url); return *this; }
 
-    void setBeta(const std::string& beta) { session_.setBeta(beta); }
+    auto& setBeta(const std::string& beta) { session_.setBeta(beta); return *this; }
 
     // Configure TLS verification (defaults: verify_peer = true, verify_host = true).
-    void setTlsOptions(bool verify_peer = true, bool verify_host = true, const std::string& ca_info = "", const std::string& ca_path = "") { session_.setTlsOptions(verify_peer, verify_host, ca_info, ca_path); }
+    auto& setTlsOptions(bool verify_peer = true, bool verify_host = true, const std::string& ca_info = "", const std::string& ca_path = "") { session_.setTlsOptions(verify_peer, verify_host, ca_info, ca_path); return *this; }
 
     // Convenience to disable TLS verification (use only for debugging).
-    void setInsecure() { setTlsOptions(false, false); }
+    auto& setInsecure() { setTlsOptions(false, false); return *this; }
 
     // Configure request timeouts.
-    void setTimeouts(std::chrono::milliseconds connect_timeout, std::chrono::milliseconds total_timeout) { session_.setTimeouts(connect_timeout, total_timeout); }
+    auto& setTimeouts(std::chrono::milliseconds connect_timeout, std::chrono::milliseconds total_timeout) { session_.setTimeouts(connect_timeout, total_timeout); return *this; }
 
     // void change_token(const std::string& token) { token_ = token; };
-    void setThrowException(bool throw_exception) { throw_exception_ = throw_exception; }
+    auto& setThrowException(bool throw_exception) { throw_exception_ = throw_exception; return *this; }
 
-    void setMultiformPart(const std::pair<std::string, std::string>& filefield_and_filepath, const std::map<std::string, std::string>& fields) { session_.setMultiformPart(filefield_and_filepath, fields); }
+    auto& setMultiformPart(const std::pair<std::string, std::string>& filefield_and_filepath, const std::map<std::string, std::string>& fields) { session_.setMultiformPart(filefield_and_filepath, fields); return *this; }
 
     Json post(const std::string& suffix, const std::string& data, const std::string& contentType) {
         setParameters(suffix, data, contentType);

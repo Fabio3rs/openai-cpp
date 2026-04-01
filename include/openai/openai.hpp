@@ -34,6 +34,8 @@
 #include <vector>
 #include <sstream>
 #include <mutex>
+#include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 
@@ -63,12 +65,10 @@ class Session {
 public:
     Session(bool throw_exception) : throw_exception_{throw_exception} {
         initCurl();
-        ignoreSSL();
     }
 
     Session(bool throw_exception, std::string proxy_url) : throw_exception_{ throw_exception } {
         initCurl();
-        ignoreSSL();
         setProxyUrl(proxy_url);
     }
 
@@ -87,6 +87,8 @@ public:
             throw std::runtime_error("curl cannot initialize"); // here we throw it shouldn't happen
         }
         curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1);
+        applyTimeouts();
+        applyTlsOptions();
     }
 
     void ignoreSSL() {
@@ -106,6 +108,8 @@ public:
     }
 
     void setBeta(const std::string& beta) { beta_ = beta; }
+    void setTlsOptions(bool verify_peer, bool verify_host, const std::string& ca_info, const std::string& ca_path);
+    void setTimeouts(std::chrono::milliseconds connect_timeout, std::chrono::milliseconds total_timeout);
 
     void setBody(const std::string& data);
     void setMultiformPart(const std::pair<std::string, std::string>& filefield_and_filepath, const std::map<std::string, std::string>& fields);
@@ -117,6 +121,9 @@ public:
     std::string easyEscape(const std::string& text);
 
 private:
+    void applyTlsOptions();
+    void applyTimeouts();
+
     static size_t writeFunction(void* ptr, size_t size, size_t nmemb, std::string* data) {
         data->append((char*) ptr, size * nmemb);
         return size * nmemb;
@@ -131,10 +138,52 @@ private:
     std::string token_;
     std::string organization_;
     std::string beta_;
+    bool verify_peer_ = true;
+    bool verify_host_ = true;
+    std::string ca_info_;
+    std::string ca_path_;
+    std::chrono::milliseconds connect_timeout_{std::chrono::milliseconds{5000}};
+    std::chrono::milliseconds total_timeout_{std::chrono::milliseconds{30000}};
 
     bool        throw_exception_;
     std::mutex  mutex_request_;
 };
+
+inline void Session::applyTimeouts() {
+    if (curl_) {
+        const auto connect_ms = std::max<long>(0L, static_cast<long>(connect_timeout_.count()));
+        const auto total_ms   = std::max<long>(0L, static_cast<long>(total_timeout_.count()));
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connect_ms);
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, total_ms);
+    }
+}
+
+inline void Session::setTimeouts(std::chrono::milliseconds connect_timeout, std::chrono::milliseconds total_timeout) {
+    connect_timeout_ = std::max(connect_timeout, std::chrono::milliseconds{0});
+    total_timeout_   = std::max(total_timeout, std::chrono::milliseconds{0});
+    applyTimeouts();
+}
+
+inline void Session::applyTlsOptions() {
+    if (curl_) {
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, verify_peer_ ? 1L : 0L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, verify_host_ ? 2L : 0L);
+        if (!ca_info_.empty()) {
+            curl_easy_setopt(curl_, CURLOPT_CAINFO, ca_info_.c_str());
+        }
+        if (!ca_path_.empty()) {
+            curl_easy_setopt(curl_, CURLOPT_CAPATH, ca_path_.c_str());
+        }
+    }
+}
+
+inline void Session::setTlsOptions(bool verify_peer, bool verify_host, const std::string& ca_info, const std::string& ca_path) {
+    verify_peer_ = verify_peer;
+    verify_host_ = verify_host;
+    ca_info_ = ca_info;
+    ca_path_ = ca_path;
+    applyTlsOptions();
+}
 
 inline void Session::setBody(const std::string& data) { 
     if (curl_) {
@@ -450,6 +499,8 @@ public:
             session_.setUrl(base_url);
             session_.setToken(token_, organization_);
             session_.setBeta(beta);
+            session_.setTimeouts(std::chrono::milliseconds{5000}, std::chrono::milliseconds{30000});
+            session_.setTlsOptions(true, true, "", "");
         }
     
     OpenAI(const OpenAI&)               = delete;
@@ -462,6 +513,15 @@ public:
     void setProxy(const std::string& url) { session_.setProxyUrl(url); }
 
     void setBeta(const std::string& beta) { session_.setBeta(beta); }
+
+    // Configure TLS verification (defaults: verify_peer = true, verify_host = true).
+    void setTlsOptions(bool verify_peer = true, bool verify_host = true, const std::string& ca_info = "", const std::string& ca_path = "") { session_.setTlsOptions(verify_peer, verify_host, ca_info, ca_path); }
+
+    // Convenience to disable TLS verification (use only for debugging).
+    void setInsecure() { setTlsOptions(false, false); }
+
+    // Configure request timeouts.
+    void setTimeouts(std::chrono::milliseconds connect_timeout, std::chrono::milliseconds total_timeout) { session_.setTimeouts(connect_timeout, total_timeout); }
 
     // void change_token(const std::string& token) { token_ = token; };
     void setThrowException(bool throw_exception) { throw_exception_ = throw_exception; }

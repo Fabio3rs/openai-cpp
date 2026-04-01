@@ -244,7 +244,7 @@ inline Response Session::makeRequest(const std::string& contentType) {
     std::lock_guard<std::mutex> lock(mutex_request_);
     
     struct SListFreeAll {
-        void operator()(curl_slist* list) const {
+        void operator()(curl_slist* list) const noexcept {
             if (list) {
                 curl_slist_free_all(list);
             }

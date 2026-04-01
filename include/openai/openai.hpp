@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <memory>
 
 #ifndef CURL_STATICLIB
 #include <curl/curl.h>
@@ -242,21 +243,30 @@ inline Response Session::deletePrepare() {
 inline Response Session::makeRequest(const std::string& contentType) {
     std::lock_guard<std::mutex> lock(mutex_request_);
     
-    struct curl_slist* headers = NULL;
+    struct SListFreeAll {
+        void operator()(curl_slist* list) const {
+            if (list) {
+                curl_slist_free_all(list);
+            }
+        }
+    };
+    using slistptr_t = std::unique_ptr<curl_slist, SListFreeAll>;
+
+    slistptr_t headers{nullptr};
     if (!contentType.empty()) {
-        headers = curl_slist_append(headers, std::string{"Content-Type: " + contentType}.c_str());
+        headers.reset(curl_slist_append(headers.release(), std::string{"Content-Type: " + contentType}.c_str()));
         if (contentType == "multipart/form-data") {
-            headers = curl_slist_append(headers, "Expect:");
+            headers.reset(curl_slist_append(headers.release(), "Expect:"));
         }
     }
-    headers = curl_slist_append(headers, std::string{"Authorization: Bearer " + token_}.c_str());
+    headers.reset(curl_slist_append(headers.release(), std::string{"Authorization: Bearer " + token_}.c_str()));
     if (!organization_.empty()) {
-        headers = curl_slist_append(headers, std::string{"OpenAI-Organization: " + organization_}.c_str());
+        headers.reset(curl_slist_append(headers.release(), std::string{"OpenAI-Organization: " + organization_}.c_str()));
     }
     if (!beta_.empty()) {
-        headers = curl_slist_append(headers, std::string{"OpenAI-Beta: " + beta_}.c_str());
+        headers.reset(curl_slist_append(headers.release(), std::string{"OpenAI-Beta: " + beta_}.c_str()));
     }
-    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
     
     std::string response_string;

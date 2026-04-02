@@ -24,6 +24,7 @@
 #define OPENAI_HPP_
 
 
+#include <cstdio>
 #if OPENAI_VERBOSE_OUTPUT
 #pragma message ("OPENAI_VERBOSE_OUTPUT is ON")
 #endif
@@ -38,6 +39,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <memory>
+#include <functional>
+#include <utility>
+#include <string_view>
+#include <atomic>
+#include <optional>
 #include <memory>
 
 #ifndef CURL_STATICLIB
@@ -59,6 +66,93 @@ struct Response {
     std::string text;
     bool        is_error;
     std::string error_message;
+};
+
+enum class StreamControl { Continue, Pause, Stop };
+
+struct SseEvent {
+    std::string event;
+    std::string data;
+};
+
+struct ChatStreamCallbacks {
+    std::function<StreamControl(const Json&)> on_data;
+    std::function<void()> on_done;
+    std::function<void(const std::string&)> on_error;
+    // Optional external control hook polled before processing each chunk
+    std::function<StreamControl()> control;
+};
+
+// Tiny SSE parser: accumulates bytes, splits on blank line, tolerates \r\n.
+class SseParser {
+  public:
+    using EventCallback = std::function<void(const SseEvent&)>;
+
+    explicit SseParser(EventCallback cb) : callback_{std::move(cb)} {}
+
+    // Feed raw bytes from HTTP body; returns false if callback signals stop.
+    bool feed(std::string_view chunk,
+              const std::function<bool()> &should_stop = {}) {
+        buffer_.append(chunk.data(), chunk.size());
+        while (true) {
+            const auto pos = find_separator();
+            if (pos == std::string::npos) break;
+            const std::string event_block = buffer_.substr(0, pos);
+            if (!consume_event(event_block)) return false;
+            if (should_stop && should_stop()) return false;
+            buffer_.erase(0, pos + separator_len_);
+        }
+        return true;
+    }
+
+  private:
+    size_t find_separator() {
+        // Check for \r\n\r\n first, then \n\n.
+        const auto crlf = buffer_.find("\r\n\r\n");
+        if (crlf != std::string::npos) {
+            separator_len_ = 4;
+            return crlf;
+        }
+        const auto lf = buffer_.find("\n\n");
+        if (lf != std::string::npos) {
+            separator_len_ = 2;
+            return lf;
+        }
+        return std::string::npos;
+    }
+
+    bool consume_event(const std::string& block) {
+        std::string current_event;
+        std::string current_data;
+
+        std::istringstream iss(block);
+        std::string line;
+        while (std::getline(iss, line)) {
+            // trim trailing carriage return
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("event:", 0) == 0) {
+                auto value = line.substr(6);
+                if (!value.empty() && value.front() == ' ') value.erase(0, 1);
+                current_event = std::move(value);
+            } else if (line.rfind("data:", 0) == 0) {
+                auto value = line.substr(5);
+                if (!value.empty() && value.front() == ' ') value.erase(0, 1);
+                if (!current_data.empty()) current_data.push_back('\n');
+                current_data += value;
+            }
+        }
+
+        if (current_event.empty() && current_data.empty()) {
+            return true; // ignore keep-alives / comments
+        }
+
+        callback_(SseEvent{std::move(current_event), std::move(current_data)});
+        return true;
+    }
+
+    std::string buffer_;
+    size_t separator_len_{2};
+    EventCallback callback_;
 };
 
 // Simple curl Session inspired by CPR
@@ -119,6 +213,12 @@ public:
     Response postPrepare(const std::string& contentType = "");
     Response deletePrepare();
     Response makeRequest(const std::string& contentType = "");
+
+    // Streaming (SSE) -------------------------------------------------------
+    // Handler returns StreamControl for this write chunk.
+    using StreamHandler = std::function<StreamControl(std::string_view)>;
+
+    Response streamRequest(std::string_view contentType, StreamHandler handler);
     std::string easyEscape(const std::string& text);
 
 private:
@@ -148,6 +248,8 @@ private:
 
     bool        throw_exception_;
     std::mutex  mutex_request_;
+    std::shared_ptr<StreamHandler> active_stream_handler_;
+    bool stop_requested_{false};
 };
 
 inline void Session::applyTimeouts() {
@@ -223,11 +325,18 @@ inline Response Session::getPrepare() {
         curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
         curl_easy_setopt(curl_, CURLOPT_POST, 0L);
         curl_easy_setopt(curl_, CURLOPT_NOBODY, 0L);
+        curl_easy_setopt(curl_, CURLOPT_CUSTOMREQUEST, nullptr);
     }
     return makeRequest();
 }
 
 inline Response Session::postPrepare(const std::string& contentType) {
+    if (curl_) {
+        curl_easy_setopt(curl_, CURLOPT_HTTPGET, 0L);
+        curl_easy_setopt(curl_, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl_, CURLOPT_NOBODY, 0L);
+        curl_easy_setopt(curl_, CURLOPT_CUSTOMREQUEST, nullptr);
+    }
     return makeRequest(contentType);
 }
 
@@ -235,6 +344,7 @@ inline Response Session::deletePrepare() {
     if (curl_) {
         curl_easy_setopt(curl_, CURLOPT_HTTPGET, 0L);
         curl_easy_setopt(curl_, CURLOPT_NOBODY, 0L);
+        curl_easy_setopt(curl_, CURLOPT_POST, 0L);
         curl_easy_setopt(curl_, CURLOPT_CUSTOMREQUEST, "DELETE");
     }
     return makeRequest();
@@ -242,6 +352,7 @@ inline Response Session::deletePrepare() {
 
 inline Response Session::makeRequest(const std::string& contentType) {
     std::lock_guard<std::mutex> lock(mutex_request_);
+    active_stream_handler_.reset();
     
     struct SListFreeAll {
         void operator()(curl_slist* list) const noexcept {
@@ -276,6 +387,7 @@ inline Response Session::makeRequest(const std::string& contentType) {
     curl_easy_setopt(curl_, CURLOPT_HEADERDATA, &header_string);
 
     res_ = curl_easy_perform(curl_);
+    active_stream_handler_.reset();
 
     bool is_error = false;
     std::string error_msg{};
@@ -291,6 +403,124 @@ inline Response Session::makeRequest(const std::string& contentType) {
     }
 
     return { response_string, is_error, error_msg };
+}
+
+inline Response Session::streamRequest(std::string_view contentType,
+                                       StreamHandler handler) {
+    std::lock_guard<std::mutex> lock(mutex_request_);
+    stop_requested_ = false;
+    if (curl_) {
+        curl_easy_setopt(curl_, CURLOPT_HTTPGET, 0L);
+        curl_easy_setopt(curl_, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl_, CURLOPT_NOBODY, 0L);
+        curl_easy_setopt(curl_, CURLOPT_CUSTOMREQUEST, nullptr);
+    }
+
+    struct SListFreeAll {
+        void operator()(curl_slist* list) const noexcept {
+            if (list) {
+                curl_slist_free_all(list);
+            }
+        }
+    };
+    using slistptr_t = std::unique_ptr<curl_slist, SListFreeAll>;
+
+    slistptr_t headers{nullptr};
+    if (!contentType.empty()) {
+        headers.reset(curl_slist_append(headers.release(),
+                                        (std::string("Content-Type: ").append(contentType)).c_str()));
+        if (contentType == "multipart/form-data") {
+            headers.reset(curl_slist_append(headers.release(), "Expect:"));
+        }
+    }
+    headers.reset(curl_slist_append(headers.release(),
+                                    std::string{"Authorization: Bearer " + token_}.c_str()));
+    if (!organization_.empty()) {
+        headers.reset(curl_slist_append(headers.release(),
+                                        std::string{"OpenAI-Organization: " + organization_}.c_str()));
+    }
+    if (!beta_.empty()) {
+        headers.reset(curl_slist_append(headers.release(),
+                                        std::string{"OpenAI-Beta: " + beta_}.c_str()));
+    }
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers.get());
+    curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+
+    active_stream_handler_ = std::make_shared<StreamHandler>(std::move(handler));
+
+    // Streaming write callback: forward raw bytes to handler, which can abort.
+    std::string header_string;
+    auto write_fn = +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+        const size_t total = size * nmemb;
+        auto* self = static_cast<Session*>(userdata);
+        if (!self) {
+            return total;
+        }
+        auto fn_ptr = self->active_stream_handler_;
+        if (!fn_ptr) {
+            return total;
+        }
+        StreamControl decision = StreamControl::Continue;
+        try {
+            decision = (*fn_ptr)(std::string(ptr, total));
+        } catch (...) {
+            decision = StreamControl::Stop;
+        }
+        switch (decision) {
+        case StreamControl::Continue:
+            return total;
+        case StreamControl::Pause:
+            curl_easy_pause(self->curl_, CURLPAUSE_RECV);
+            curl_easy_pause(self->curl_, CURLPAUSE_CONT);
+            return CURL_WRITEFUNC_PAUSE;
+        case StreamControl::Stop:
+        default:
+            self->stop_requested_ = true;
+            return 0; // abort transfer
+        }
+    };
+
+    auto headerfunc = +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+        try {
+            auto *s = static_cast<std::string *>(userdata);
+            s->append(ptr, size * nmemb);
+        } catch (...) {
+            // Handle any exceptions that may occur
+            // NOLINT
+        }
+        return size * nmemb;
+    };
+    curl_easy_setopt(curl_, CURLOPT_HEADERFUNCTION, headerfunc);
+    curl_easy_setopt(curl_, CURLOPT_HEADERDATA, &header_string);
+
+    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_fn);
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
+
+    res_ = curl_easy_perform(curl_);
+
+    bool is_error = false;
+    std::string error_msg{};
+    const bool stopped_intentionally = stop_requested_;
+    stop_requested_ = false;
+    active_stream_handler_.reset();
+    if (res_ != CURLE_OK) {
+        if (res_ == CURLE_WRITE_ERROR && stopped_intentionally) {
+            is_error = false;
+        } else {
+            is_error = true;
+            error_msg = "OpenAI stream curl_easy_perform() failed: " +
+                        std::string{curl_easy_strerror(res_)};
+            if (throw_exception_) {
+                throw std::runtime_error(error_msg);
+            } else {
+                std::cerr << error_msg << '\n';
+            }
+        }
+    }
+
+    // No aggregated body in streaming mode; handler consumes data. We still
+    // return a Response for uniform error shape.
+    return {std::string{}, is_error, error_msg};
 }
 
 inline std::string Session::easyEscape(const std::string& text) {
@@ -372,6 +602,9 @@ private:
 struct CategoryCompletion {
     Json create(Json input);
 
+    // Streaming alias to chat streaming for parity with legacy API.
+    void stream(Json input, const ChatStreamCallbacks &cb);
+
     CategoryCompletion(OpenAI& openai) : openai_{openai} {}
 
 private:
@@ -382,6 +615,10 @@ private:
 // Given a prompt, the model will return one or more predicted chat completions.
 struct CategoryChat {
     Json create(Json input);
+
+    using StreamCallbacks = ChatStreamCallbacks;
+
+    void stream(Json input, const StreamCallbacks& cb);
 
     CategoryChat(OpenAI& openai) : openai_{openai} {}
 
@@ -616,6 +853,10 @@ public:
         return base_url;
     }
 
+    // Streaming POST helper (SSE) used by high-level categories.
+    void stream(const std::string &suffix, const Json &json,
+                const ChatStreamCallbacks &cb);
+
 private:
     std::string base_url;
 
@@ -690,6 +931,121 @@ inline std::string bool_to_string(const bool b) {
     std::ostringstream ss;
     ss << std::boolalpha << b;
     return ss.str();
+}
+
+inline void OpenAI::stream(const std::string &suffix, const Json &json,
+                           const ChatStreamCallbacks &cb) {
+    // Prepare request
+    const auto body = json.dump();
+    const auto complete_url = base_url + suffix;
+    session_.setUrl(complete_url);
+    session_.setBody(body);
+
+    std::atomic<StreamControl> control{StreamControl::Continue};
+    bool error_signalled = false;
+    bool saw_done = false;
+
+    auto on_event = [&](const _detail::SseEvent &ev) {
+        static constexpr std::string_view done_token = "[DONE]";
+        if (ev.data == done_token) {
+            saw_done = true;
+            if (cb.on_done) cb.on_done();
+            return;
+        }
+        StreamControl decision = StreamControl::Continue;
+        try {
+            auto parsed = Json::parse(ev.data);
+            if (cb.on_data) {
+                decision = cb.on_data(parsed);
+            }
+        } catch (const std::exception &e) {
+            decision = StreamControl::Stop;
+            if (cb.on_error && !error_signalled) {
+                cb.on_error(e.what());
+                error_signalled = true;
+            }
+        }
+        if (cb.control) {
+            auto ext = cb.control();
+            if (ext != StreamControl::Continue) {
+                decision = ext;
+            }
+        }
+        if (decision == StreamControl::Pause) {
+            decision = StreamControl::Continue; // No safe pause/resume without external driver
+        }
+        control.store(decision);
+    };
+
+    _detail::SseParser parser(on_event);
+
+    auto handler = [&](std::string_view raw) -> StreamControl {
+        // External control hook takes priority; if it wants to pause/stop we
+        // honor it without touching parser state.
+        if (cb.control) {
+            auto ext = cb.control();
+            if (ext != StreamControl::Continue) {
+                control.store(ext);
+                return ext == StreamControl::Pause ? StreamControl::Continue : ext;
+            }
+        }
+
+        auto current = control.load();
+        if (current == StreamControl::Pause) {
+            control.store(StreamControl::Continue);
+            current = StreamControl::Continue;
+        }
+        if (current == StreamControl::Stop) {
+            return StreamControl::Stop;
+        }
+
+        try {
+            if (!parser.feed(raw, [&] { return control.load() == StreamControl::Stop; })) {
+                control.store(StreamControl::Stop);
+                return StreamControl::Stop;
+            }
+        } catch (const std::exception &e) {
+            control.store(StreamControl::Stop);
+            if (cb.on_error && !error_signalled) {
+                cb.on_error(e.what());
+                error_signalled = true;
+            }
+            return StreamControl::Stop;
+        }
+
+        // If on_data set Pause, make it transient unless an external control
+        // callback exists to explicitly manage the paused state.
+        current = control.load();
+        if (current == StreamControl::Pause) {
+            control.store(StreamControl::Continue);
+            current = StreamControl::Continue;
+        }
+        return current;
+    };
+
+    try {
+        const auto resp = session_.streamRequest("application/json", handler);
+        const bool stopped_by_user =
+            !resp.is_error && !error_signalled &&
+            control.load() == StreamControl::Stop;
+
+        if (resp.is_error && cb.on_error && !error_signalled) {
+            cb.on_error(resp.error_message);
+            error_signalled = true;
+        } else if (stopped_by_user) {
+            if (cb.on_done) cb.on_done();
+            saw_done = true;
+        } else if (!saw_done && cb.on_done &&
+                   control.load() == StreamControl::Continue) {
+            cb.on_done();
+        }
+    } catch (const std::exception &e) {
+        if (cb.on_error) {
+            cb.on_error(e.what());
+        } else {
+            throw;
+        }
+    }
 }
 
 inline OpenAI& start(const std::string& token = "", const std::string& organization = "", bool throw_exception = true, const std::string& api_base_url = "")  {
@@ -949,10 +1305,25 @@ inline Json CategoryCompletion::create(Json input) {
     return openai_.post("completions", input);
 }
 
+inline void CategoryCompletion::stream(Json input,
+                                       const ChatStreamCallbacks &cb) {
+    if (!input.contains("stream")) {
+        input["stream"] = true;
+    }
+    openai_.stream("completions", std::move(input), cb);
+}
+
 // POST https://api.openai.com/v1/chat/completions
 // Creates a chat completion for the provided prompt and parameters
 inline Json CategoryChat::create(Json input) {
     return openai_.post("chat/completions", input);
+}
+
+inline void CategoryChat::stream(Json input, const StreamCallbacks &cb) {
+    if (!input.contains("stream")) {
+        input["stream"] = true;
+    }
+    openai_.stream("chat/completions", input, cb);
 }
 
 // POST https://api.openai.com/v1/audio/transcriptions
@@ -1173,6 +1544,7 @@ using _detail::model;
 using _detail::assistant;
 using _detail::thread;
 using _detail::completion;
+using _detail::CategoryCompletion;
 using _detail::edit;
 using _detail::image;
 using _detail::embedding;
@@ -1180,7 +1552,10 @@ using _detail::file;
 using _detail::fineTune;
 using _detail::moderation;
 using _detail::chat;
+using _detail::CategoryChat;
 using _detail::audio;
+using _detail::ChatStreamCallbacks;
+using _detail::StreamControl;
 
 using _detail::Json;
 

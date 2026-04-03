@@ -12,7 +12,11 @@ int main() {
         {"messages",
          {{{"role", "user"},
            {"content", "Stream a short paragraph about SSE;"}}}},
-        {"stream", true}};
+        {"stream", true},
+        {"stream_options", {
+            {"include_usage", true}
+        }}
+    };
 
     std::string assembled;
     bool paused_once = false;
@@ -22,6 +26,8 @@ int main() {
         openai::ChatStreamCallbacks{
             // on_data
             [&](const nlohmann::json &chunk) -> openai::StreamControl {
+                std::cout << std::endl
+                          << "chunk: " << chunk.dump(2) << std::endl;
                 if (!chunk.contains("choices") ||
                     !chunk["choices"].is_array() || chunk["choices"].empty()) {
                     return openai::StreamControl::Continue;
@@ -36,10 +42,10 @@ int main() {
                         std::cout << " [pause]\n";
                         return openai::StreamControl::Pause;
                     }*/
-                    if (assembled.size() > 180) {
+                    /*if (assembled.size() > 180) {
                         std::cout << " [stop]\n";
                         return openai::StreamControl::Stop; // demo early stop
-                    }
+                    }*/
                 }
                 return openai::StreamControl::Continue;
             },

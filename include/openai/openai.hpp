@@ -382,6 +382,17 @@ inline Response Session::makeRequest(const std::string& contentType) {
     
     std::string response_string;
     std::string header_string;
+    auto headerfunc = +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+        try {
+            auto *s = static_cast<std::string *>(userdata);
+            s->append(ptr, size * nmemb);
+        } catch (...) {
+            // Handle any exceptions that may occur
+            // NOLINT
+        }
+        return size * nmemb;
+    };
+    curl_easy_setopt(curl_, CURLOPT_HEADERFUNCTION, headerfunc);
     curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, writeFunction);
     curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response_string);
     curl_easy_setopt(curl_, CURLOPT_HEADERDATA, &header_string);
@@ -397,8 +408,41 @@ inline Response Session::makeRequest(const std::string& contentType) {
         if (throw_exception_) {
             throw std::runtime_error(error_msg);
         }
-        else {
-            std::cerr << error_msg << '\n';
+    }
+
+    // Capture HTTP error responses even when the transfer itself succeeded.
+    long http_code = 0;
+    curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code >= 400) {
+        is_error = true;
+        if (!error_msg.empty()) {
+            error_msg += "; ";
+        }
+
+        error_msg += "HTTP " + std::to_string(http_code);
+        if (!response_string.empty()) {
+            try {
+                const auto j = Json::parse(response_string);
+                if (j.contains("error")) {
+                    const auto &err = j["error"];
+                    if (err.contains("message") && err["message"].is_string()) {
+                        error_msg += ": " + err["message"].get<std::string>();
+                    } else {
+                        error_msg += ": " + err.dump();
+                    }
+                } else {
+                    error_msg += ": " + response_string;
+                }
+            } catch (...) {
+                // Not JSON; attach a trimmed body for debugging.
+                constexpr size_t kMaxSnippet = 512;
+                if (response_string.size() > kMaxSnippet) {
+                    error_msg +=
+                        ": " + response_string.substr(0, kMaxSnippet) + "...";
+                } else {
+                    error_msg += ": " + response_string;
+                }
+            }
         }
     }
 
@@ -450,13 +494,24 @@ inline Response Session::streamRequest(std::string_view contentType,
 
     // Streaming write callback: forward raw bytes to handler, which can abort.
     std::string header_string;
+    std::string response_body; // capture raw body for error surfaces
+    struct StreamCtx {
+        Session *self;
+        std::string *body;
+    } ctx{this, &response_body};
+
     auto write_fn = +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
         const size_t total = size * nmemb;
-        auto* self = static_cast<Session*>(userdata);
-        if (!self) {
+        auto* ctx = static_cast<StreamCtx*>(userdata);
+        if (!ctx || !ctx->self) {
             return total;
         }
+        auto* self = ctx->self;
         auto fn_ptr = self->active_stream_handler_;
+        // Capture up to a reasonable limit for error messages.
+        if (ctx->body && ctx->body->size() < 16384) {
+            ctx->body->append(ptr, total);
+        }
         if (!fn_ptr) {
             return total;
         }
@@ -494,7 +549,7 @@ inline Response Session::streamRequest(std::string_view contentType,
     curl_easy_setopt(curl_, CURLOPT_HEADERDATA, &header_string);
 
     curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_fn);
-    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &ctx);
 
     res_ = curl_easy_perform(curl_);
 
@@ -512,15 +567,47 @@ inline Response Session::streamRequest(std::string_view contentType,
                         std::string{curl_easy_strerror(res_)};
             if (throw_exception_) {
                 throw std::runtime_error(error_msg);
-            } else {
-                std::cerr << error_msg << '\n';
             }
         }
     }
 
-    // No aggregated body in streaming mode; handler consumes data. We still
-    // return a Response for uniform error shape.
-    return {std::string{}, is_error, error_msg};
+    long http_code = 0;
+
+    curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code >= 400) {
+        is_error = true;
+        if (!error_msg.empty()) {
+            error_msg += "; ";
+        }
+
+        error_msg += "HTTP " + std::to_string(http_code);
+        if (!response_body.empty()) {
+            try {
+                const auto j = Json::parse(response_body);
+                if (j.contains("error")) {
+                    const auto &err = j["error"];
+                    if (err.contains("message") && err["message"].is_string()) {
+                        error_msg += ": " + err["message"].get<std::string>();
+                    } else {
+                        error_msg += ": " + err.dump();
+                    }
+                } else {
+                    error_msg += ": " + response_body;
+                }
+            } catch (...) {
+                constexpr size_t kMaxSnippet = 512;
+                if (response_body.size() > kMaxSnippet) {
+                    error_msg +=
+                        ": " + response_body.substr(0, kMaxSnippet) + "...";
+                } else {
+                    error_msg += ": " + response_body;
+                }
+            }
+        }
+    }
+
+    // Return captured body so callers can surface server-side errors.
+    return {response_body, is_error, error_msg};
 }
 
 inline std::string Session::easyEscape(const std::string& text) {
